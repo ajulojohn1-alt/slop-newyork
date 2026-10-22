@@ -33,6 +33,14 @@ commits small, sliced outputs instead:
    `wikipedia`, `opening_hours`, long values >120 chars, etc.) is dropped —
    this alone typically shrinks a fat export by ~60 %. Pass
    `--no-strip-properties` to keep every tag.
+
+   The slicer also **drops minor highways** by default: only `motorway`,
+   `trunk`, `primary`, `secondary`, `tertiary` (and their `_link` variants)
+   survive; `residential`, `service`, `unclassified`, `footway`, `path`,
+   `cycleway`, `steps`, `pedestrian`, `living_street`, `track` and other
+   minor classes are excluded entirely. In raw OSM exports these minor
+   roads make up the bulk of vertex count, so this filter typically halves
+   the slice again. Pass `--keep-minor-highways` to retain them.
 3. The slice is written as standard GeoJSON (`*.slice.geojson` is explicitly
    *un-ignored* in `.gitignore`) and is small enough (~1–5 MB depending on
    source density) to commit normally.

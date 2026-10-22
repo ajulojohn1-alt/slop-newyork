@@ -31,6 +31,11 @@ Notes:
       (@id, timestamp, changeset, import artefacts); dropping them plus
       compact JSON encoding typically shrinks the slice well under 50 MB.
       Use --no-strip-properties to keep every tag.
+    * Minor roads are dropped: features tagged highway=residential, service,
+      unclassified, footway, path, cycleway, steps, pedestrian, living_street,
+      track, etc. are excluded by default; only motorway, trunk, primary,
+      secondary and tertiary roads (plus their links) survive. Use
+      --keep-minor-highways to keep everything.
 """
 
 import argparse
@@ -82,6 +87,34 @@ DROP_PREFIXES = ("addr:", "tax", "ref:", "int_ref", "old_name", "alt_name",
                  "leaf_", "tree_", "artwork_", "image", "photo")
 
 _NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_.:-]*$")
+
+# ---------------------------------------------------------------------------
+# Highway class filter: keep only the arterial network for the driveable map.
+# Minor roads (residential, service, footway, path, cycleway, ...) are pure
+# vertex-count bloat in raw OSM exports and dominate file size; dropping them
+# typically halves the slice.
+# ---------------------------------------------------------------------------
+
+KEEP_HIGHWAYS = {
+    "motorway", "motorway_link",
+    "trunk", "trunk_link",
+    "primary", "primary_link",
+    "secondary", "secondary_link",
+    "tertiary", "tertiary_link",
+}
+
+
+def keep_highway(props):
+    """True if a feature should survive the minor-road filter.
+
+    Only LineString/MultiLineString road features carry `highway`; anything
+    without that tag (buildings, land use, points of interest) is untouched.
+    Features with an unknown highway value are dropped (they are almost
+    always minor/path classes)."""
+    hw = props.get("highway")
+    if hw is None:
+        return True
+    return hw in KEEP_HIGHWAYS
 
 
 def keep_property(key):
@@ -280,25 +313,35 @@ def main(argv=None):
                     action="store_false", default=True,
                     help="keep every input property (default: strip to the "
                          "tags the Three.js bake actually uses)")
+    ap.add_argument("--keep-minor-highways", dest="drop_minor",
+                    action="store_false", default=True,
+                    help="keep residential/service/footway/path/cycleway "
+                         "roads too (default: only motorway/trunk/primary/"
+                         "secondary/tertiary survive)")
     args = ap.parse_args(argv)
 
     print(f"loading {args.infile} ...", file=sys.stderr)
     features = load_geojson(args.infile)
     print(f"{len(features)} features loaded; slicing to bbox {args.bbox}"
-          + ("" if args.strip_props else "; keeping all properties"),
+          + ("" if args.strip_props else "; keeping all properties")
+          + ("" if args.drop_minor else "; keeping minor highways"),
           file=sys.stderr)
 
     kept = []
     skipped_bad = 0
     dropped_keys = 0
+    dropped_minor_roads = 0
     for feat in features:
         geom = feat.get("geometry")
         if geom is None:
             skipped_bad += 1
             continue
+        props = feat.get("properties") or {}
+        if args.drop_minor and not keep_highway(props):
+            dropped_minor_roads += 1
+            continue
         ok, new_geom = filter_geometry(geom, args.bbox)
         if ok:
-            props = feat.get("properties") or {}
             if args.strip_props:
                 stripped = strip_properties(props)
                 dropped_keys += len(props) - len(stripped)
@@ -321,6 +364,7 @@ def main(argv=None):
     import os
     size_mb = os.path.getsize(args.outfile) / (1024 * 1024)
     print(f"wrote {len(kept)} features ({skipped_bad} without geometry, "
+          f"{dropped_minor_roads} minor-road features dropped, "
           f"{dropped_keys} non-essential properties dropped) "
           f"-> {args.outfile} [{size_mb:.2f} MB]", file=sys.stderr)
     if size_mb > 45:
