@@ -439,11 +439,13 @@ for (const f of feats) {
 }
 log(`${roads.length} road polylines, ${roads.reduce((t, r) => t + r.pts.length, 0)} pts`);
 
-// Merge chains per (name|class|width) so routing gets long polylines where names repeat
+// Merge chains per (name|class|width) so routing gets long polylines where names repeat.
+// oneWay is AND-ed across a chain: mixing conflicting restrictions would mis-route, so segments that disagree
+// on direction stay separate chains (each keeps its own tag).
 function mergeRoadsChains(list) {
   const byKey = new Map();
   for (const r of list) {
-    const key = `${r.name}|${r.cls}|${r.w}`;
+    const key = `${r.name}|${r.cls}|${r.w}|ow${r.oneWay}`;
     if (!byKey.has(key)) byKey.set(key, []);
     byKey.get(key).push(r);
   }
@@ -471,7 +473,7 @@ function mergeRoadsChains(list) {
         line.push(...cur.pts.slice(1));
         cur = ends.get(k(cur.pts[cur.pts.length - 1]));
       }
-      merged.push({ name, cls, w, speed: segs[0].speed, lanes: segs[0].lanes, surface: segs[0].surface, pts: rdp(line, 0.8).map(([x, z]) => [q(x), q(z)]) });
+      merged.push({ name, cls, w, oneWay: segs[0].oneWay, speed: segs[0].speed, lanes: segs[0].lanes, surface: segs[0].surface, pts: rdp(line, 0.8).map(([x, z]) => [q(x), q(z)]) });
     }
   }
   return merged;
@@ -653,6 +655,196 @@ if (thamesLine.length >= 2) {
 log(`${bridges.length} Thames-crossing bridge segments`);
 
 // =====================================================================================================================
+// 11a. BLOCKS — city blocks = faces of the road-centreline planar subdivision (NYC GEO.blocks-shaped).
+// The engine's block contract is [outline flat[x,z,...], lot rects, park share, park name, rectangular flag, frames].
+// Here the outline is traced from the arrangement of road centrelines; "lot rects" are the axis-aligned bounding
+// boxes of building footprints inside the face (London lots aren't rectilinear parcels like Manhattan's); park
+// share is the fraction of the face covered by park polygons. Tiny slivers (< 150 m²) and mega-faces (> 40 ha)
+// are dropped — they come from dual-carriageway duplicates and Royal Park interiors respectively.
+// =====================================================================================================================
+const EPS_MERGE = 1.2; // m: centreline endpoints this close count as one graph node
+const snapKey = (x, z) => `${Math.round(x / EPS_MERGE)},${Math.round(z / EPS_MERGE)}`;
+
+// --- planar-subdivision helpers (half-edge over the snapped road graph) -------------------------------------------
+const nodes = [];                       // [[x, z], ...] world coords (slice-centred)
+const nodeXY = new Map();               // snap key -> node array entry (with ._id)
+const edges = new Set();                // undirected keys i|j
+const edgeKey = (i, j) => (i < j ? `${i}|${j}` : `${j}|${i}`);
+
+// split segment a->b at every existing node lying strictly inside it (within tolerance), in order along the segment.
+// Nodes are looked up by id from the registry; no node objects are mutated, so ids can never go stale.
+function emitSplit(aId, bId) {
+  const a = nodes[aId], b = nodes[bId];
+  const dx = b[0] - a[0], dz = b[1] - a[1];
+  const L2 = dx * dx + dz * dz;
+  if (!L2) return;
+  const hits = [];
+  for (let id = 0; id < nodes.length; id++) {
+    if (id === aId || id === bId) continue;
+    const xy = nodes[id];
+    const t = ((xy[0] - a[0]) * dx + (xy[1] - a[1]) * dz) / L2;
+    if (t <= 0.01 || t >= 0.99) continue;
+    const px = a[0] + t * dx, pz = a[1] + t * dz;
+    const d2 = (px - xy[0]) ** 2 + (pz - xy[1]) ** 2;
+    if (d2 <= EPS_MERGE * EPS_MERGE) hits.push([t, id]);
+  }
+  hits.sort((u, v) => u[0] - v[0]);
+  let prev = aId;
+  for (const [, id] of hits) { emitSplit(prev, id); prev = id; }
+  edges.add(edgeKey(prev, bId));
+}
+function nodeIdAt(x, z) {
+  const ix = Math.round(x / EPS_MERGE), iz = Math.round(z / EPS_MERGE);
+  for (let dx = -1; dx <= 1; dx++) for (let dz = -1; dz <= 1; dz++) {
+    const m = nodeXY.get(`${ix + dx},${iz + dz}`);
+    if (m !== undefined && Math.hypot(nodes[m][0] - x, nodes[m][1] - z) <= EPS_MERGE) return m;
+  }
+  const id = nodes.length;
+  nodes.push([x, z]);
+  nodeXY.set(`${ix},${iz}`, id);
+  return id;
+}
+for (const r of roads) {                // raw (unmerged) segments: full fidelity for junction detection
+  const pts = r.pts;
+  for (let i = 0; i + 1 < pts.length; i++) {
+    const a = nodeIdAt(...pts[i]), b = nodeIdAt(...pts[i + 1]);
+    if (a !== b) emitSplit(a, b);
+  }
+}
+log(`block graph: ${nodes.length} nodes, ${edges.size} snapped+split edges`);
+
+// adjacency: undirected half-edge structure. Nodes are first clustered into components; faces are traced per
+// component with the outer boundary discarded (negative signed area in this CW walk convention), so dangling
+// centreline spurs can never produce runaway walks or swallow whole districts into one "face".
+const adj = nodes.map(() => []);
+for (const key of edges) {
+  const [i, j] = key.split('|').map(Number);
+  adj[i].push(j); adj[j].push(i);
+}
+for (let i = 0; i < adj.length; i++) {
+  const [x, z] = nodes[i];
+  adj[i].sort((p, q) => Math.atan2(-(nodes[q][1] - z), nodes[q][0] - x) - Math.atan2(-(nodes[p][1] - z), nodes[p][0] - x));
+}
+// connected components (BFS over adj)
+const compOf = new Int32Array(nodes.length).fill(-1);
+const comps = [];
+for (let s = 0; s < nodes.length; s++) {
+  if (compOf[s] !== -1 || !adj[s].length) continue;
+  const cid = comps.length, stack = [s];
+  compOf[s] = cid;
+  const members = [];
+  while (stack.length) {
+    const u = stack.pop();
+    members.push(u);
+    for (const v of adj[u]) if (compOf[v] === -1) { compOf[v] = cid; stack.push(v); }
+  }
+  comps.push(members);
+}
+log(`block subdivision: ${comps.length} connected road components`);
+// trace bounded faces per component: walk each unused directed half-edge taking the sharpest right turn
+// (next index in the CCW-sorted ring wraps clockwise). Interior faces come out with negative shoelace area here.
+const usedDir = new Set();
+const dirKey = (i, j) => `${i}>${j}`;
+const cwIndex = (nbrs, from) => (nbrs.indexOf(from) + 1) % nbrs.length;
+const faces = [];
+let degenerate = 0, outerDropped = 0;
+for (let cid = 0; cid < comps.length; cid++) {
+  const startDir = [];
+  for (const n of comps[cid]) for (const m of adj[n]) if (!usedDir.has(dirKey(n, m))) startDir.push([n, m]);
+  for (const [s0, s1] of startDir) {
+    if (usedDir.has(dirKey(s0, s1))) continue;
+    const ringIds = [];
+    let cur = s0, nxt = s1, guard = 0;
+    let closed = false;
+    while (guard++ < 100000) {
+      if (cur === s0 && nxt === s1 && ringIds.length) { closed = true; break; }
+      usedDir.add(dirKey(cur, nxt));
+      ringIds.push(cur);
+      const prev = cur; cur = nxt; nxt = adj[cur][cwIndex(adj[cur], prev)];
+    }
+    if (!closed || ringIds.length < 3) { degenerate++; continue; } // open-ended spur walk
+    const ring = ringIds.map((id) => nodes[id]);
+    const signed = ringArea(ring);
+    if (signed >= 0) { outerDropped++; continue; } // outer boundary of this component
+    const area = -signed;
+    if (area < 150 || area > 400000) continue; // slivers & mega-faces
+    faces.push({ ring, area });
+  }
+}
+log(`faces: ${faces.length} kept (${degenerate} spur walks, ${outerDropped} outer boundaries dropped)`);
+faces.sort((a, b) => b.area - a.area);
+
+// park coverage + building bbox rects per face (pointInRing defined in section 2)
+const parkRings = parks.map((p) => p.ring); // baked rings are flat arrays; unflatten lazily below
+const parkPolys = parkRings.map((f) => { const r = []; for (let i = 0; i + 1 < f.length; i += 2) r.push([f[i], f[i + 1]]); return r; });
+const blocksOut = [];
+for (const fc of faces) {
+  const cx = fc.ring.reduce((t, p) => t + p[0], 0) / fc.ring.length;
+  const cz = fc.ring.reduce((t, p) => t + p[1], 0) / fc.ring.length;
+  let parkShare = 0;
+  for (const pr of parkPolys) if (pointInRing([cx, cz], pr)) { parkShare = 1; break; }
+  const rects = [];
+  for (const bld of buildings) {
+    if (Math.abs(bld.cx - cx) > 260 || Math.abs(bld.cz - cz) > 260) continue; // cheap reject on footprint centroid
+    if (!pointInRing([bld.cx, bld.cz], fc.ring)) continue;
+    const bb = bbox(bld.ring);
+    if (!Number.isFinite(bb.x0)) continue;
+    rects.push([q(bb.x0), q(bb.z0), q(bb.x1), q(bb.z1)]);
+    if (rects.length >= 48) break; // cap per-block detail (engine only scatters props from these)
+  }
+  blocksOut.push([flat(fc.ring), rects, parkShare, '', rects.length ? 1 : 0, 0]);
+}
+log(`${blocksOut.length} blocks traced from the road subdivision`);
+
+// =====================================================================================================================
+// 11b. ROAD GRAPH — London-wide drivable centreline graph, NYC GEO.roadGraph-shaped:
+//   nodes: flat [x0, z0, x1, z1, ...]; links: [nodeA, nodeB, nameIdx, widthM, lanes, dir(1 a->b, -1 b->a, 0 both), innerFlatPts]
+// Built from the merged road chains; chain endpoints snapped to the same block-graph nodes so routing and blocks agree.
+// =====================================================================================================================
+const rgNodes = [];           // flat pairs
+const rgCells = new Map();    // snap key -> node index
+const rgNameIds = new Map();
+const rgNames = [];
+const rgNameId = (n) => { if (!rgNameIds.has(n)) { rgNameIds.set(n, rgNames.length); rgNames.push(n); } return rgNameIds.get(n); };
+function rgNodeIdAt(x, z) {
+  const ix = Math.floor(x / EPS_MERGE), iz = Math.floor(z / EPS_MERGE);
+  for (let dx = -1; dx <= 1; dx++) for (let dz = -1; dz <= 1; dz++) {
+    for (const id of rgCells.get(`${ix + dx},${iz + dz}`) || []) {
+      if (Math.hypot(rgNodes[id * 2] - x, rgNodes[id * 2 + 1] - z) <= EPS_MERGE) return id;
+    }
+  }
+  const id = rgNodes.length / 2;
+  rgNodes.push(q(x), q(z));
+  const k = `${ix},${iz}`;
+  if (!rgCells.has(k)) rgCells.set(k, []);
+  rgCells.get(k).push(id);
+  return id;
+}
+const rgLinks = [];
+{
+  let skipped = 0;
+  for (const r of roadLines) {
+    if (r.tunnel || r.cls === 'proposed') { skipped++; continue; } // tunnels not drivable at grade here
+    const pts = r.pts;
+    if (!Array.isArray(pts) || pts.length < 2) { skipped++; continue; }
+    // split chains at interior vertices that coincide with an existing node (degree points become junctions)
+    let a = rgNodeIdAt(...pts[0]);
+    for (let i = 1; i < pts.length; i++) {
+      const isEnd = i === pts.length - 1;
+      const b = rgNodeIdAt(...pts[i]);
+      if (a !== b) {
+        const inner = isEnd ? pts.slice(1, -1).flatMap(([x, z]) => [q(x), q(z)]) : [];
+        const dir = r.oneWay === 1 ? 1 : r.oneWay === -1 ? -1 : 0;
+        rgLinks.push([a, b, rgNameId(r.name || ''), r.w || CLASS_WIDTH[r.cls] || 8, r.lanes || 1, dir, inner]);
+      }
+      a = b;
+      if (isEnd) break;
+    }
+  }
+  log(`road graph: ${rgNodes.length / 2} nodes, ${rgLinks.length} links (${skipped} chains skipped)`);
+}
+
+// =====================================================================================================================
 // 12. SELF-TEST — run with: node tools/build-london-geodata.mjs --selftest
 // Proves the geometry normalisation cannot throw on any GeoJSON shape, including the exact failure mode seen
 // before (bare float coordinate items reaching ringArea via an assumed-Polygon nesting).
@@ -707,6 +899,10 @@ chunks.push(`  stats: ${JSON.stringify({ buildings: buildings.length, roads: roa
 chunks.push(`  buildings: ${JSON.stringify(buildings)},\n`);
 chunks.push(`  lots: ${JSON.stringify(lots)},\n`);
 chunks.push(`  roads: ${JSON.stringify(roadLines)},\n`);
+// NYC GEO-shaped fields so the engine contract is satisfied directly from window.LDN:
+// blocks: [outline flat, lot rects, park share, park name, rectangular, frames]; roadGraph: { nodes flat, links, names }
+chunks.push(`  blocks: ${JSON.stringify(blocksOut)},\n`);
+chunks.push(`  roadGraph: ${JSON.stringify({ nodes: rgNodes, links: rgLinks, names: rgNames })},\n`);
 chunks.push(`  water: ${JSON.stringify(waterPolys)},\n`);
 chunks.push(`  parks: ${JSON.stringify(parks)},\n`);
 chunks.push(`  landmarks: ${JSON.stringify(landmarks)},\n`);
