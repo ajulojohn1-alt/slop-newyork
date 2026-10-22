@@ -23,6 +23,16 @@ commits small, sliced outputs instead:
    The default bounding box covers Inner London (Zone 1–2 core):
    `(-0.24, 51.46) – (0.02, 51.56)` in lon/lat WGS84. Override with
    `--bbox minlon,minlat,maxlon,maxlat` if needed.
+
+   By default the slicer also **strips properties** down to only the OSM tags
+   the Three.js bake consumes (`building`, `building:levels`, `height`,
+   `min_height`, `roof:shape`, `name`, `highway`, `width`, `surface`,
+   `oneway`, `landuse`, `leisure`, `amenity`, `shop`, `natural`, `man_made`,
+   `historic`, `railway`, `waterway`, `bridge`, `tunnel`, `layer`, …). All
+   import/edit metadata (`@id`, `timestamp`, `changeset`, `addr:*`,
+   `wikipedia`, `opening_hours`, long values >120 chars, etc.) is dropped —
+   this alone typically shrinks a fat export by ~60 %. Pass
+   `--no-strip-properties` to keep every tag.
 3. The slice is written as standard GeoJSON (`*.slice.geojson` is explicitly
    *un-ignored* in `.gitignore`) and is small enough (~1–5 MB depending on
    source density) to commit normally.

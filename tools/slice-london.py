@@ -25,16 +25,92 @@ Notes:
     * Rings/polygons are kept if ANY vertex falls inside the bbox; boundary
       clipping is intentionally not performed (the bake step tolerates
       overhanging edges).
+    * Properties are stripped down to the handful of OSM tags the Three.js
+      bake actually consumes (building type, height/levels, name, highway
+      class, width, surface, ...). Raw exports carry dozens of useless tags
+      (@id, timestamp, changeset, import artefacts); dropping them plus
+      compact JSON encoding typically shrinks the slice well under 50 MB.
+      Use --no-strip-properties to keep every tag.
 """
 
 import argparse
 import json
+import re
 import sys
 
 # Default: Inner London (Zone 1-2 core), lon/lat WGS84.
 DEFAULT_BBOX = (-0.24, 51.46, 0.02, 51.56)
 
 NDigits = 6
+
+# ---------------------------------------------------------------------------
+# Property whitelist: the only OSM tags the Three.js bake reads.
+# ---------------------------------------------------------------------------
+
+# Exact-match keys kept for any feature with a geometry we care about.
+KEEP_KEYS = {
+    # identity / classification
+    "name", "layer",
+    # buildings
+    "building", "building:levels", "height", "min_height", "roof:shape",
+    # land use / green space
+    "landuse", "leisure", "amenity", "shop", "natural", "man_made",
+    "historic", "railway", "waterway", "water", "boundary", "place",
+    # roads / paths
+    "highway", "cycleway", "oneway", "junction",
+    # physical attributes used for extrusion widths and materials
+    "width", "maxwidth", "est_width", "surface", "bridge", "tunnel",
+}
+
+# Prefix matches (namespaced tags): building:*, amenity:*, historic:*, ...
+KEEP_PREFIXES = ("building:", "amenity:", "shop:", "leisure:", "historic:")
+
+# Drop these exact keys even if they'd otherwise match (OSM/import metadata).
+DROP_KEYS = {
+    "id", "@id", "type", "version", "timestamp", "changeset", "uid", "user",
+    "created_by", "converted_by", "source", "source:name", "note",
+    "fixme", "todo", "wikipedia", "wikidata", "wiki_commons",
+    "operator", "brand", "brand:wikidata", "phone", "email", "website",
+    "facebook", "twitter", "opening_hours", "payment_types", "cuisine",
+    "diet", "stars", "addr:city", "addr:postcode", "addr:state",
+    "addr:country", "is_in", "admin_level",
+}
+
+# Drop namespaced junk wholesale.
+DROP_PREFIXES = ("addr:", "tax", "ref:", "int_ref", "old_name", "alt_name",
+                 "loc_name", "official_name", "short_name", "genus", "species",
+                 "leaf_", "tree_", "artwork_", "image", "photo")
+
+_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_.:-]*$")
+
+
+def keep_property(key):
+    """True if an OSM tag key should survive into the baked slice."""
+    if key in DROP_KEYS:
+        return False
+    if key.startswith(DROP_PREFIXES):
+        return False
+    if key in KEEP_KEYS or key.startswith(KEEP_PREFIXES):
+        return True
+    return False
+
+
+def strip_properties(props):
+    """Return a compact dict containing only whitelisted, non-empty tags."""
+    out = {}
+    for k, v in props.items():
+        if not isinstance(v, str):
+            continue                      # skip nested objects/arrays
+        if not v or v == "no" or v == "none":
+            continue
+        if not _NAME_RE.match(k):         # ignore weird/exotic keys
+            continue
+        if not keep_property(k):
+            continue
+        if len(v) > 120:                  # sanity cap on absurd values
+            continue
+        out[k] = v
+    return out
 
 
 def parse_bbox(text):
@@ -200,15 +276,21 @@ def main(argv=None):
     ap.add_argument("--bbox", type=parse_bbox, default=DEFAULT_BBOX,
                     help="minlon,minlat,maxlon,maxlat "
                          f"(default: {','.join(map(str, DEFAULT_BBOX))})")
+    ap.add_argument("--no-strip-properties", dest="strip_props",
+                    action="store_false", default=True,
+                    help="keep every input property (default: strip to the "
+                         "tags the Three.js bake actually uses)")
     args = ap.parse_args(argv)
 
     print(f"loading {args.infile} ...", file=sys.stderr)
     features = load_geojson(args.infile)
-    print(f"{len(features)} features loaded; slicing to bbox {args.bbox}",
+    print(f"{len(features)} features loaded; slicing to bbox {args.bbox}"
+          + ("" if args.strip_props else "; keeping all properties"),
           file=sys.stderr)
 
     kept = []
     skipped_bad = 0
+    dropped_keys = 0
     for feat in features:
         geom = feat.get("geometry")
         if geom is None:
@@ -216,8 +298,13 @@ def main(argv=None):
             continue
         ok, new_geom = filter_geometry(geom, args.bbox)
         if ok:
+            props = feat.get("properties") or {}
+            if args.strip_props:
+                stripped = strip_properties(props)
+                dropped_keys += len(props) - len(stripped)
+                props = stripped
             out_feat = {"type": "Feature",
-                        "properties": feat.get("properties") or {},
+                        "properties": props,
                         "geometry": new_geom}
             if feat.get("id") is not None:
                 out_feat["id"] = feat["id"]
@@ -233,11 +320,12 @@ def main(argv=None):
 
     import os
     size_mb = os.path.getsize(args.outfile) / (1024 * 1024)
-    print(f"wrote {len(kept)} features ({skipped_bad} without geometry) "
+    print(f"wrote {len(kept)} features ({skipped_bad} without geometry, "
+          f"{dropped_keys} non-essential properties dropped) "
           f"-> {args.outfile} [{size_mb:.2f} MB]", file=sys.stderr)
     if size_mb > 45:
         print("WARNING: output still exceeds GitHub's comfortable 50 MB "
-              "limit; consider a tighter bbox or stripping properties.",
+              "limit; consider a tighter bbox.",
               file=sys.stderr)
     return 0
 
