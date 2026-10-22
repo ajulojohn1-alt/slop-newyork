@@ -1,1 +1,10 @@
 .DS_Store
+
+# Raw local geodata (too large for GitHub, e.g. the full-UK 97MB GeoJSON).
+# Keep these files in tools/data/ locally; commit only sliced outputs
+# matching *.slice.geojson / the small JSON files already tracked there.
+tools/data/*.geojson
+!tools/data/*.slice.geojson
+tools/data/*.osm.pbf
+tools/data/raw/
+node_modules/
