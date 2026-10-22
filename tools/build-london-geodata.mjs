@@ -777,20 +777,128 @@ faces.sort((a, b) => b.area - a.area);
 // park coverage + building bbox rects per face (pointInRing defined in section 2)
 const parkRings = parks.map((p) => p.ring); // baked rings are flat arrays; unflatten lazily below
 const parkPolys = parkRings.map((f) => { const r = []; for (let i = 0; i + 1 < f.length; i += 2) r.push([f[i], f[i + 1]]); return r; });
-const blocksOut = [];
+// Park faces: the road subdivision's mega-faces swallow whole Royal Parks (Hyde Park spans ~2.5 km of open
+// land). Split every face along park-ring edges so park blocks become their own faces — this both fixes the
+// >48-rect cap (one giant face was starving all others of footprints) and gives buildings.js real park islands.
+const parkEdgeSet = new Set();
+for (const pr of parkPolys) {
+  for (let i = 0, j = pr.length - 1; i < pr.length; j = i++) {
+    const a = `${Math.round(pr[j][0] * 10)},${Math.round(pr[j][1] * 10)}`;
+    const b = `${Math.round(pr[i][0] * 10)},${Math.round(pr[i][1] * 10)}`;
+    parkEdgeSet.add(a < b ? a + '|' + b : b + '|' + a);
+  }
+}
+const splitFaces = [];
 for (const fc of faces) {
+  if (fc.area <= 900 * 900) { splitFaces.push(fc); continue; }
+  const adj = new Map();
+  const addEdge = (u, v) => {
+    if (!adj.has(u)) adj.set(u, []);
+    if (!adj.has(v)) adj.set(v, []);
+    adj.get(u).push(v);
+    adj.get(v).push(u);
+  };
+  const R = fc.ring;
+  for (let i = 0, j = R.length - 1; i < R.length; j = i++) {
+    const a = `${Math.round(R[j][0] * 10)},${Math.round(R[j][1] * 10)}`;
+    const b = `${Math.round(R[i][0] * 10)},${Math.round(R[i][1] * 10)}`;
+    if (parkEdgeSet.has(a < b ? a + '|' + b : b + '|' + a)) addEdge(j, i);
+  }
+  if (adj.size < 4) { splitFaces.push(fc); continue; } // no usable park boundary inside this face
+  const walkFrom = (s, t) => { // greedy shortest ring s -> t -> s through park edges only
+    const path = [s];
+    const seen = new Set([s]);
+    let cur = s;
+    while (cur !== t) {
+      const nbs = adj.get(cur) || [];
+      const nxt = nbs.find((n) => !seen.has(n)) ?? nbs.find((n) => n !== s || path.length > 1);
+      if (nxt === undefined) return null;
+      seen.add(nxt);
+      path.push(nxt);
+      cur = nxt;
+      if (path.length > R.length) return null;
+    }
+    return path;
+  };
+  const nodes = [...adj.keys()];
+  const used = new Set();
+  for (const u of nodes) for (const v of adj.get(u)) {
+    const key = u < v ? u + '|' + v : v + '|' + u;
+    if (used.has(key)) continue;
+    used.add(key);
+    const path = walkFrom(u, v);
+    if (!path || path.length < 3) continue;
+    const ring = path.map((i) => R[i]);
+    const signed = ringArea(ring);
+    if (signed >= 0) continue; // outer-boundary traversal, not an interior island
+    const area = -signed;
+    if (area < 150 || area > 400000) continue;
+    splitFaces.push({ ring, area });
+  }
+}
+log(`faces after park splits: ${splitFaces.length} (${faces.length} before)`);
+const BLD_CELL = 300;
+const bldGrid = new Map();
+for (const bld of buildings) {
+  const bb = bld.bb || bbox(bld.ring);
+  bld.bb = bb;
+  if (!Number.isFinite(bb.x0)) continue;
+  const ix0 = Math.floor(bb.x0 / BLD_CELL), ix1 = Math.floor(bb.x1 / BLD_CELL);
+  const iz0 = Math.floor(bb.z0 / BLD_CELL), iz1 = Math.floor(bb.z1 / BLD_CELL);
+  for (let ix = ix0; ix <= ix1; ix++) for (let iz = iz0; iz <= iz1; iz++) {
+    const k = ix * 100000 + iz;
+    if (!bldGrid.has(k)) bldGrid.set(k, []);
+    bldGrid.get(k).push(bld);
+  }
+}
+// Does a building bbox overlap a face ring? Liang-Barsky segment-vs-box test on every edge,
+// with a corner-in-ring fallback for rings fully enclosing the box.
+function bboxOverlapsRing(bb, ring) {
+  if (pointInRing([bb.x0, bb.z0], ring) || pointInRing([bb.x1, bb.z0], ring) ||
+      pointInRing([bb.x0, bb.z1], ring) || pointInRing([bb.x1, bb.z1], ring)) return true;
+  for (let i = 0; i < ring.length - 1; i++) {
+    const [x0, z0] = ring[i], [x1, z1] = ring[i + 1];
+    // Liang-Barsky clip of segment (x0,z0)->(x1,z1) against the axis-aligned box
+    let tmin = 0, tmax = 1;
+    const dx = x1 - x0, dz = z1 - z0;
+    const p = [-dx, dx, -dz, dz];
+    const q = [x0 - bb.x0, bb.x1 - x0, z0 - bb.z0, bb.z1 - z0];
+    let ok = true;
+    for (let k = 0; k < 4; k++) {
+      if (p[k] === 0) { if (q[k] < 0) { ok = false; break; } continue; }
+      const r = q[k] / p[k];
+      if (p[k] < 0) { if (r > tmax) { ok = false; break; } if (r > tmin) tmin = r; }
+      else { if (r < tmin) { ok = false; break; } if (r < tmax) tmax = r; }
+    }
+    if (ok && tmin <= tmax) return true;
+  }
+  return false;
+}
+const blocksOut = [];
+for (const fc of splitFaces) {
   const cx = fc.ring.reduce((t, p) => t + p[0], 0) / fc.ring.length;
   const cz = fc.ring.reduce((t, p) => t + p[1], 0) / fc.ring.length;
   let parkShare = 0;
   for (const pr of parkPolys) if (pointInRing([cx, cz], pr)) { parkShare = 1; break; }
+  const fb = bbox(fc.ring);
+  const seen = new Set();
   const rects = [];
-  for (const bld of buildings) {
-    if (Math.abs(bld.cx - cx) > 260 || Math.abs(bld.cz - cz) > 260) continue; // cheap reject on footprint centroid
-    if (!pointInRing([bld.cx, bld.cz], fc.ring)) continue;
-    const bb = bbox(bld.ring);
-    if (!Number.isFinite(bb.x0)) continue;
-    rects.push([q(bb.x0), q(bb.z0), q(bb.x1), q(bb.z1)]);
-    if (rects.length >= 48) break; // cap per-block detail (engine only scatters props from these)
+  const bx0 = Math.floor(fb.x0 / BLD_CELL), bx1 = Math.floor(fb.x1 / BLD_CELL);
+  const bz0 = Math.floor(fb.z0 / BLD_CELL), bz1 = Math.floor(fb.z1 / BLD_CELL);
+  for (let ix = bx0; ix <= bx1 && rects.length < 48; ix++) for (let iz = bz0; iz <= bz1 && rects.length < 48; iz++) {
+    for (const bld of bldGrid.get(ix * 100000 + iz) || []) {
+      if (seen.has(bld)) continue;
+      seen.add(bld);
+      if (bld.claimed) continue; // each footprint belongs to exactly one block (largest overlapping face first)
+      if (bld.bb.x1 < fb.x0 || bld.bb.x0 > fb.x1 || bld.bb.z1 < fb.z0 || bld.bb.z0 > fb.z1) continue;
+      // centroid inside the face wins; otherwise (footprints straddling curbs of large irregular London
+      // faces) assign by bbox overlap
+      const centred = pointInRing([bld.cx, bld.cz], fc.ring);
+      if (!centred && !bboxOverlapsRing(bld.bb, fc.ring)) continue;
+      bld.claimed = true;
+      rects.push([q(bld.bb.x0), q(bld.bb.z0), q(bld.bb.x1), q(bld.bb.z1)]);
+      if (rects.length >= 48) break; // cap per-block detail (engine only scatters props from these)
+    }
   }
   blocksOut.push([flat(fc.ring), rects, parkShare, '', rects.length ? 1 : 0, 0]);
 }
