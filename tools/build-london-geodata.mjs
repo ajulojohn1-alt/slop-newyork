@@ -621,7 +621,19 @@ for (const f of feats) {
   }
   if (!pos) continue; // GeometryCollection without usable members: skip safely
   seenLandmark.add(id);
-  landmarks.push({ id, name: nm, x: q(pos[0] - CX), z: q(pos[1] - CZ), ring, h: buildingHeight(p) });
+  let h = buildingHeight(p);
+  // Point-tagged POIs carry no height/footprint: borrow both from the building whose footprint contains the
+  // point (The Shard / St Paul's are mapped as a nameless polygon + a named node)
+  const near = buildings.find((b) => {
+    const px = pos[0] - CX, pz = pos[1] - CZ;
+    return b.bb ? (px >= b.bb.x0 && px <= b.bb.x1 && pz >= b.bb.z0 && pz <= b.bb.z1)
+                : Math.hypot(b.cx - px, b.cz - pz) < 80;
+  });
+  if (near) {
+    if (h === DEFAULT_H) h = near.h;
+    if (!ring) ring = bakeRing(near.ring.map(([x, z]) => [x + CX, z + CZ]), 0.35);
+  }
+  landmarks.push({ id, name: nm, x: q(pos[0] - CX), z: q(pos[1] - CZ), ring, h });
 }
 log(`${landmarks.length} landmarks: ${landmarks.map((l) => l.id).join(', ')}`);
 
@@ -874,12 +886,44 @@ function bboxOverlapsRing(bb, ring) {
   }
   return false;
 }
+// Park identity per face: a face is parkland when its centroid sits inside a park ring OR most of its
+// corners do (the subdivision's mega-faces swallow whole parks, so centroid-only tests miss them).
+const FACE_PARKS = ['Hyde Park', 'Kensington Gardens', "St. James's Park", "St James’s Park", 'Green Park',
+  'Regent', 'Primrose', 'Holland Park', 'Battersea', 'Victoria Tower', 'Westminster', 'Garden'];
+function parkNameForFace(ring) {
+  const cx = ring.reduce((t, p) => t + p[0], 0) / ring.length;
+  const cz = ring.reduce((t, p) => t + p[1], 0) / ring.length;
+  const votes = new Map();
+  const vote = (nm) => { if (!nm) return; votes.set(nm, (votes.get(nm) || 0) + 1); };
+  for (let i = 0; i < parkPolys.length; i++) {
+    const pr = parkPolys[i];
+    const inside = pointInRing([cx, cz], pr) ? 3 : 0;
+    let corners = 0;
+    for (let k = 0; k < pr.length; k += Math.max(1, pr.length >> 4)) if (pointInRing(pr[k], ring)) corners++;
+    const v = Math.max(inside, corners);
+    if (v >= 2) { const nm = parks[i].name || ''; if (nm) vote(nm); }
+  }
+  // faces traced inside a park polygon but unnamed by the road graph: label the biggest ones
+  if (!votes.size && ring.length > 8) {
+    let best = null, bestArea = 0;
+    for (let i = 0; i < parkPolys.length; i++) {
+      if (!parks[i].name) continue;
+      if (!pointInRing([cx, cz], parkPolys[i])) continue;
+      if (parkPolys[i].length > bestArea) { bestArea = parkPolys[i].length; best = parks[i].name; }
+    }
+    if (best) vote(best);
+  }
+  let name = '', n = 0;
+  for (const [k, v] of votes) if (v > n) { n = v; name = k; }
+  if (name && !FACE_PARKS.some((s) => name.toLowerCase().includes(s.toLowerCase()))) return '';
+  return name;
+}
 const blocksOut = [];
 for (const fc of splitFaces) {
   const cx = fc.ring.reduce((t, p) => t + p[0], 0) / fc.ring.length;
   const cz = fc.ring.reduce((t, p) => t + p[1], 0) / fc.ring.length;
-  let parkShare = 0;
-  for (const pr of parkPolys) if (pointInRing([cx, cz], pr)) { parkShare = 1; break; }
+  const parkName = parkNameForFace(fc.ring);
+  const parkShare = parkName ? 1 : 0;
   const fb = bbox(fc.ring);
   const seen = new Set();
   const rects = [];
@@ -900,7 +944,7 @@ for (const fc of splitFaces) {
       if (rects.length >= 48) break; // cap per-block detail (engine only scatters props from these)
     }
   }
-  blocksOut.push([flat(fc.ring), rects, parkShare, '', rects.length ? 1 : 0, 0]);
+  blocksOut.push([flat(fc.ring), parkShare ? [] : rects, parkShare, parkName, parkShare ? 0 : (rects.length ? 1 : 0), 0]);
 }
 log(`${blocksOut.length} blocks traced from the road subdivision`);
 
